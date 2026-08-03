@@ -1,0 +1,21 @@
+semantic_projector:
+  input_dim : 1024
+  hidden_dim: 512
+  output_dim: 768
+  layers    : 3
+  dropout   : 0.1
+  normalize : True
+  activation: ReLU
+
+speaker_projector:
+  input_dim : 1024
+  hidden_dim: 512
+  output_dim: 768
+  layers    : 3
+  dropout   : 0.1
+  normalize : True
+  activation: ReLU
+  
+audio_header:
+  input_dim : 768
+  output_dim: 8194

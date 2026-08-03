@@ -1,0 +1,46 @@
+# Python & Bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual Environment
+.venv/
+venv/
+env/
+ENV/
+
+# Model Checkpoints & Pre-trained Weights
+models/checkpoints/
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.ckpt
+*.onnx
+
+# Datasets & Large Audio/Text Files
+*.wav
+*.mp3
+*.flac
+*.ogg
+data/*.csv
+data/Processed/
+
+# Logs & Experiment Trackers
+wandb/
+*.log
+runs/
+.gradio/
+
+# Environments & IDEs
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Temporary & Cache Files
+.cache/
+.pytest_cache/

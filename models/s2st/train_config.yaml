@@ -1,0 +1,44 @@
+# Training 
+training:
+  epochs: 10
+  batch_size: 4
+  gradient_accumulation_steps: 16     
+  max_grad_norm: 1.0
+  num_workers: 8
+  seed: 75
+
+# Optimizer 
+optimizer:
+  type: AdamW
+  lr: 3e-4
+  weight_decay: 0.01
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+
+# Scheduler 
+scheduler:
+  warmup_ratio: 0.1
+  min_lr: 1e-6
+
+# Loss 
+loss:
+  label_smoothing: 0.1
+
+# WandB
+wandb:
+  project: "S2ST-Phase1"
+  run_name: "phase1-multitask-v1"
+
+# Data 
+data:
+  train_csv:
+    - "data/train.csv"
+  valid_csv:
+    - "data/valid.csv"
+  sample_rate: 16000
+
+# Paths 
+paths:
+  envit5: "models/checkpoints/envit5-translation"
+  sparktts: "models/checkpoints/Spark-TTS-0.5B"
+  checkpoint_dir: "models/checkpoints/phase1"
