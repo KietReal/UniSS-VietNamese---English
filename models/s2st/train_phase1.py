@@ -6,7 +6,7 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 from accelerate import Accelerator
 from accelerate.utils import set_seed
-from transformers import get_cosine_with_min_lr_schedule_with_warmup
+from transformers.optimization import get_cosine_with_min_lr_schedule_with_warmup
 from tqdm import tqdm
 
 from Dataset.Phase1 import Phase1_S2ST, collate_fn_phase1
@@ -60,6 +60,11 @@ def compute_loss(loss_fn, text_prediction, audio_prediction, labels, audio_label
 
 
 def main():
+    # Add SparkTTS directory to sys.path
+    spark_tts_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "../SparkTTS"))
+    if spark_tts_dir not in sys.path and os.path.exists(spark_tts_dir):
+        sys.path.insert(0, spark_tts_dir)
+
     # Load Config 
     config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'train_config.yaml')
     with open(config_path, 'r') as f:

@@ -86,7 +86,7 @@ S2ST/
     │   ├── envit5-translation/    # Pre-trained EnViT5 model
     │   └── Spark-TTS-0.5B/       # Pre-trained Spark-TTS model
     │
-    ├── Spark-TTS/                 # Spark-TTS source code (dependency)
+    ├── SparkTTS/                  # SparkTTS source code (dependency)
     │   └── sparktts/              # BiCodec tokenizer, modules, etc.
     │
     ├── EnViT5/                    # EnViT5 standalone test environment
