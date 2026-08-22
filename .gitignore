@@ -44,3 +44,7 @@ runs/
 # Temporary & Cache Files
 .cache/
 .pytest_cache/
+
+# Evaluation Scripts
+eval_phase1.py
+models/s2st/Evaluation/eval_phase1.py

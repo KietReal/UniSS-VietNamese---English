@@ -95,6 +95,64 @@ class Phase1_S2ST(Dataset):
         }
 
 
+class Phase1_S2ST_eval(Phase1_S2ST):
+    def __init__(self, files_csv: list, tokenizer, split: str, eval_task: str,
+                 transforms: list|None = None, sr: int = 16000,
+                 rir_recordings=None, musan_cuts=None):
+        super().__init__(
+            files_csv=files_csv, tokenizer=tokenizer, split=split,
+            transforms=transforms, sr=sr, rir_recordings=rir_recordings, musan_cuts=musan_cuts
+        )
+        if eval_task not in self.task_types:
+            raise ValueError(f"Invalid eval_task: {eval_task}. Must be one of {self.task_types}")
+        self.eval_task = eval_task
+
+    def __getitem__(self, idx):
+        task = self.eval_task
+
+        ## Special tokens logic
+        if task in ['s2tt_vi2en', 's2tt_en2vi']:
+            c_task = self.tokenizer.convert_tokens_to_ids('<S2TT>')
+            c_lang = self.tokenizer.convert_tokens_to_ids('<ENG>' if task == 's2tt_vi2en' else '<VIE>')
+        elif task in ['mt_vi2en', 'mt_en2vi']:
+            c_task = self.tokenizer.convert_tokens_to_ids('<MT>')
+            c_lang = self.tokenizer.convert_tokens_to_ids('<ENG>' if task == 'mt_vi2en' else '<VIE>')
+        elif task in ['tts_en', 'tts_vi']:
+            c_task = self.tokenizer.convert_tokens_to_ids('<TTS>')
+            c_lang = self.tokenizer.convert_tokens_to_ids('<VIE>' if task == 'tts_vi' else '<ENG>')
+        else: # ASR
+            c_task = self.tokenizer.convert_tokens_to_ids('<ASR>')
+            c_lang = self.tokenizer.convert_tokens_to_ids('<ENG>' if task == 'asr_en' else '<VIE>')
+
+        row = self.datas.iloc[idx] 
+
+        ## Viet Text
+        with open(row['VieText'], 'r', encoding='utf-8') as f:
+            VieText = f.read().strip()
+        ids_VieText = self.tokenizer.encode(VieText)
+
+        ### English Text
+        with open(row['EngText'], 'r', encoding='utf-8') as f:
+            EngText = f.read().strip()
+        ids_EngText = self.tokenizer.encode(EngText)
+
+        ## Audio loading (no augmentation for evaluation)
+        vie_audio_np, _ = librosa.load(path=row['VieAudio'], sr=self.sr, mono=True)
+        eng_audio_np, _ = librosa.load(path=row['EngAudio'], sr=self.sr, mono=True)
+        augmented_VieAudio = torch.from_numpy(vie_audio_np).float()
+        augmented_EngAudio = torch.from_numpy(eng_audio_np).float()
+
+        return {
+            'task': task, 
+            'c_task': [c_task], 
+            'c_lang': [c_lang], 
+            'bos': [self.bos],
+            'AugmentVieAudio': augmented_VieAudio, # 1D FloatTensor
+            'VieText': ids_VieText,                # List of ints
+            'AugmentEngAudio': augmented_EngAudio, # 1D FloatTensor
+            'EngText': ids_EngText                 # List of ints
+        }
+
 def collate_fn_phase1(batch):
     text_encode   = []
     text_decode   = []

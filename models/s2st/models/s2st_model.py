@@ -1,5 +1,13 @@
 from typing import Any
 import os
+import sys
+
+# Add SparkTTS directory to sys.path before importing sparktts
+current_file_dir = os.path.dirname(os.path.abspath(__file__))
+spark_tts_dir = os.path.abspath(os.path.join(current_file_dir, "../../SparkTTS"))
+if spark_tts_dir not in sys.path:
+    sys.path.insert(0, spark_tts_dir)
+
 import yaml
 import torch
 import torch.nn as nn
@@ -17,7 +25,7 @@ class S2STModel(nn.Module):
         super().__init__()
         
         current_dir = os.path.dirname(os.path.abspath(__file__))
-        config_path = os.path.abspath(os.path.join(current_dir, 'config.yaml'))
+        config_path = os.path.abspath(os.path.join(current_dir, '../config.yaml'))
         if not os.path.exists(config_path):
             config_path = os.path.abspath(os.path.join(current_dir, '../../config.yaml'))
             
@@ -35,7 +43,13 @@ class S2STModel(nn.Module):
         if sparkTTS_path is None:
             sparkTTS_path = os.path.abspath(os.path.join(current_dir, '../checkpoints/Spark-TTS-0.5B'))
         
-        self.envit5 = AutoModelForSeq2SeqLM.from_pretrained(envit5_path)
+        try:
+            self.envit5 = AutoModelForSeq2SeqLM.from_pretrained(
+                envit5_path,
+                attn_implementation="sdpa" if torch.cuda.is_available() else None
+            )
+        except Exception:
+            self.envit5 = AutoModelForSeq2SeqLM.from_pretrained(envit5_path)
         self.envit5_tokenizer = AutoTokenizer.from_pretrained(envit5_path)
 
         # Add special tokens to tokenizer and resize LLM embedding table
@@ -43,6 +57,10 @@ class S2STModel(nn.Module):
         num_added = self.envit5_tokenizer.add_special_tokens({'additional_special_tokens': special_tokens})
         if num_added > 0:
             self.envit5.resize_token_embeddings(len(self.envit5_tokenizer))
+
+        # Enable gradient checkpointing to save VRAM
+        if hasattr(self.envit5, "gradient_checkpointing_enable"):
+            self.envit5.gradient_checkpointing_enable()
 
         self.embedding = self.envit5.shared
         self.bos = self.envit5_tokenizer.convert_tokens_to_ids('<BOS>')
@@ -60,9 +78,7 @@ class S2STModel(nn.Module):
         self.audio_eos_embed = nn.Parameter(torch.randn(1, 768) * 0.02)
 
         ### 3. Initalize Audio Tokenizer
-        # BiCodecTokenizer is NOT an nn.Module, so we store it as a plain attribute.
-        # We freeze the actual nn.Module components inside it.
-        self.sparkTTS = BiCodecTokenizer.from_pretrained(model_dir=sparkTTS_path, device=torch.device("cpu"))
+        self.sparkTTS = BiCodecTokenizer(model_dir=sparkTTS_path, device=torch.device("cpu"))
         self.semantic_quantizer = self.sparkTTS.model.quantizer
         self.speaker_encoder = self.sparkTTS.model.speaker_encoder
         
@@ -79,6 +95,14 @@ class S2STModel(nn.Module):
         """Derive device from model parameters — always consistent with Accelerate."""
         return next(self.parameters()).device
 
+    def train(self, mode: bool = True):
+        """Ensure SparkTTS submodules stay in eval mode during training."""
+        super().train(mode)
+        if hasattr(self, 'sparkTTS') and hasattr(self.sparkTTS, 'model'):
+            self.sparkTTS.model.eval()
+            self.sparkTTS.feature_extractor.eval()
+        return self
+
     def _move_sparkTTS_to_device(self):
         """Move non-nn.Module SparkTTS components to the correct device.
         
@@ -89,7 +113,8 @@ class S2STModel(nn.Module):
         self.sparkTTS.model = self.sparkTTS.model.to(device)
         self.sparkTTS.feature_extractor = self.sparkTTS.feature_extractor.to(device)
         self.sparkTTS.device = device
-        # Update references that point to sub-components
+        self.sparkTTS.model.eval()
+        self.sparkTTS.feature_extractor.eval()
         self.semantic_quantizer = self.sparkTTS.model.quantizer
         self.speaker_encoder = self.sparkTTS.model.speaker_encoder
 

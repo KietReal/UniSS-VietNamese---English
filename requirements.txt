@@ -1,6 +1,7 @@
 # Core
-torch==2.5.1
-torchaudio==2.5.1
+torch>=2.5.1
+torchvision>=0.20.1
+torchaudio>=2.5.1
 transformers==4.46.2
 accelerate>=0.34.0
 safetensors==0.5.2
@@ -26,6 +27,7 @@ pyyaml>=6.0
 # Training utilities
 tqdm==4.66.5
 wandb>=0.16.0
+bitsandbytes>=0.41.0
 
 # Metrics / Evaluation
 jiwer==4.0.0

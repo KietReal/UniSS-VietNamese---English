@@ -1,4 +1,12 @@
 import os
+import sys
+
+# Ensure SparkTTS directory is in sys.path before importing S2STModel or Dataset
+current_dir = os.path.dirname(os.path.abspath(__file__))
+spark_tts_dir = os.path.abspath(os.path.join(current_dir, "../SparkTTS"))
+if spark_tts_dir not in sys.path:
+    sys.path.insert(0, spark_tts_dir)
+
 import yaml
 import torch
 import torch.nn as nn
@@ -8,9 +16,11 @@ from accelerate import Accelerator
 from accelerate.utils import set_seed
 from transformers.optimization import get_cosine_with_min_lr_schedule_with_warmup
 from tqdm import tqdm
+import bitsandbytes as bnb
 
 from Dataset.Phase1 import Phase1_S2ST, collate_fn_phase1
 from models.s2st_model import S2STModel
+from utils.audio_utils import download_augmentation
 from utils.metric.Phase1 import Phase1Metrics
 from utils.tracker import CheckpointTracker
 
@@ -33,6 +43,13 @@ def compute_loss(loss_fn, text_prediction, audio_prediction, labels, audio_label
         text_pred = text_prediction[text_mask]   # (N_text, L_model, vocab)
         text_tgt = labels[text_mask]              # (N_text, L_labels)
 
+        # Align sequence lengths if prediction length differs from target length
+        if text_tgt.size(1) < text_pred.size(1):
+            pad_len = text_pred.size(1) - text_tgt.size(1)
+            text_tgt = torch.nn.functional.pad(text_tgt, (0, pad_len), value=-100)
+        elif text_pred.size(1) < text_tgt.size(1):
+            text_pred = text_pred[:, :text_tgt.size(1)]
+
         # Reshape for CrossEntropyLoss: (N*L, V) and (N*L,)
         text_pred = text_pred.reshape(-1, text_pred.size(-1))
         text_tgt = text_tgt.reshape(-1)
@@ -45,10 +62,18 @@ def compute_loss(loss_fn, text_prediction, audio_prediction, labels, audio_label
         tts_mask = sub_tasks == 3
         if tts_mask.any():
             audio_pred = audio_prediction[tts_mask]  # (N_tts, L_model, audio_vocab)
+            audio_tgt = audio_labels                 # (N_tts, L_audio)
+
+            # Align sequence lengths if prediction length differs from target length
+            if audio_tgt.size(1) < audio_pred.size(1):
+                pad_len = audio_pred.size(1) - audio_tgt.size(1)
+                audio_tgt = torch.nn.functional.pad(audio_tgt, (0, pad_len), value=-100)
+            elif audio_pred.size(1) < audio_tgt.size(1):
+                audio_pred = audio_pred[:, :audio_tgt.size(1)]
 
             # Reshape for CrossEntropyLoss: (N*L, V) and (N*L,)
             audio_pred = audio_pred.reshape(-1, audio_pred.size(-1))
-            audio_tgt = audio_labels.reshape(-1)
+            audio_tgt = audio_tgt.reshape(-1)
 
             audio_loss = loss_fn(audio_pred, audio_tgt)
             losses.append(audio_loss)
@@ -60,17 +85,12 @@ def compute_loss(loss_fn, text_prediction, audio_prediction, labels, audio_label
 
 
 def main():
-    # Add SparkTTS directory to sys.path
-    spark_tts_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "../SparkTTS"))
-    if spark_tts_dir not in sys.path and os.path.exists(spark_tts_dir):
-        sys.path.insert(0, spark_tts_dir)
-
     # Load Config 
     config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'train_config.yaml')
     with open(config_path, 'r') as f:
         cfg = yaml.safe_load(f)
 
-    set_seed(cfg['training']['seed'])
+    set_seed(int(cfg['training']['seed']))
 
     # Model
     s2st_model = S2STModel(
@@ -78,32 +98,24 @@ def main():
         sparkTTS_path=cfg['paths'].get('sparktts'),
     )
 
-    # Dataset 
+    # Dataset & Audio Augmentation (RIR + MUSAN Noise)
+    rir_recordings, musan_cuts = download_augmentation(root_dir="data/augmentation")
+
     train_dataset = Phase1_S2ST(
         files_csv=cfg['data']['train_csv'],
         tokenizer=s2st_model.envit5_tokenizer,
         split='train',
-        sr=cfg['data']['sample_rate'],
-    )
-    valid_dataset = Phase1_S2ST(
-        files_csv=cfg['data']['valid_csv'],
-        tokenizer=s2st_model.envit5_tokenizer,
-        split='valid',
-        sr=cfg['data']['sample_rate'],
+        sr=int(cfg['data']['sample_rate']),
+        rir_recordings=rir_recordings,
+        musan_cuts=musan_cuts,
     )
 
     # DataLoader 
-    batch_size = cfg['training']['batch_size']
-    num_workers = cfg['training'].get('num_workers', 8)
+    batch_size = int(cfg['training']['batch_size'])
+    num_workers = int(cfg['training'].get('num_workers', 8))
 
     train_dataloader = DataLoader(
         train_dataset, batch_size=batch_size, shuffle=True,
-        collate_fn=collate_fn_phase1, num_workers=num_workers, 
-        pin_memory=True, persistent_workers=(num_workers > 0),
-        prefetch_factor=2 if num_workers > 0 else None,
-    )
-    valid_dataloader = DataLoader(
-        valid_dataset, batch_size=batch_size, shuffle=False,
         collate_fn=collate_fn_phase1, num_workers=num_workers, 
         pin_memory=True, persistent_workers=(num_workers > 0),
         prefetch_factor=2 if num_workers > 0 else None,
@@ -112,36 +124,42 @@ def main():
     # Optimizer (excluding frozen SparkTTS)
     opt_cfg = cfg['optimizer']
     trainable_params = [p for p in s2st_model.parameters() if p.requires_grad]
-    optimizer = optim.AdamW(
+    optimizer = bnb.optim.AdamW8bit(
         trainable_params,
-        lr=opt_cfg['lr'],
-        weight_decay=opt_cfg['weight_decay'],
-        betas=tuple(opt_cfg['betas']),
-        eps=opt_cfg['eps'],
+        lr=float(opt_cfg['lr']),
+        weight_decay=float(opt_cfg['weight_decay']),
+        betas=tuple(float(b) for b in opt_cfg['betas']),
+        eps=float(opt_cfg['eps']),
     )
 
     # Loss
     loss_fn = nn.CrossEntropyLoss(
         ignore_index=-100,
-        label_smoothing=cfg['loss']['label_smoothing'],
+        label_smoothing=float(cfg['loss']['label_smoothing']),
     )
 
     # Scheduler 
     total_steps = (
         len(train_dataloader)
-        // cfg['training']['gradient_accumulation_steps']
-        * cfg['training']['epochs']
+        // int(cfg['training']['gradient_accumulation_steps'])
+        * int(cfg['training']['epochs'])
     )
     scheduler = get_cosine_with_min_lr_schedule_with_warmup(
         optimizer,
-        num_warmup_steps=int(cfg['scheduler']['warmup_ratio'] * total_steps),
+        num_warmup_steps=int(float(cfg['scheduler']['warmup_ratio']) * total_steps),
         num_training_steps=total_steps,
-        min_lr=cfg['scheduler']['min_lr']
+        min_lr=float(cfg['scheduler']['min_lr'])
     )
 
     # Accelerator 
+    wandb_cfg = cfg.get('wandb', {})
+    if 'mode' in wandb_cfg and wandb_cfg['mode']:
+        os.environ['WANDB_MODE'] = str(wandb_cfg['mode'])
+
+    mixed_precision = cfg['training'].get('mixed_precision', None)
     accelerator = Accelerator(
         log_with="wandb",
+        mixed_precision=mixed_precision,
         gradient_accumulation_steps=cfg['training']['gradient_accumulation_steps'],
     )
     accelerator.init_trackers(
@@ -150,19 +168,12 @@ def main():
         init_kwargs={"wandb": {"name": cfg['wandb']['run_name']}},
     )
 
-    s2st_model, optimizer, train_dataloader, valid_dataloader, scheduler = accelerator.prepare(
-        s2st_model, optimizer, train_dataloader, valid_dataloader, scheduler
+    s2st_model, optimizer, train_dataloader, scheduler = accelerator.prepare(
+        s2st_model, optimizer, train_dataloader, scheduler
     )
 
     unwrapped_model = accelerator.unwrap_model(s2st_model)
     unwrapped_model._move_sparkTTS_to_device()
-
-    # Metric (use the accelerator device)
-    metric = Phase1Metrics(
-        device=str(unwrapped_model.device),
-        text_tokenizer=unwrapped_model.envit5_tokenizer,
-        audio_tokenizer=unwrapped_model.sparkTTS,
-    )
 
     tracker = CheckpointTracker()
     accelerator.register_for_checkpointing(tracker)
@@ -217,102 +228,43 @@ def main():
                     batch['labels'], audio_labels, batch['sub_tasks'],
                 )
 
+                loss_val = loss.item()
                 accelerator.backward(loss)
-                accelerator.clip_grad_norm_(s2st_model.parameters(), max_grad_norm)
-                optimizer.step()
-                scheduler.step()
-                optimizer.zero_grad()
+
+                if accelerator.sync_gradients:
+                    accelerator.clip_grad_norm_(s2st_model.parameters(), max_grad_norm)
+                    optimizer.step()
+                    scheduler.step()
+                    optimizer.zero_grad()
+
+                # Free VRAM memory used by step predictions and loss tensors
+                del text_prediction, audio_prediction, audio_labels, loss
 
                 global_step += 1
                 current_lr = scheduler.get_last_lr()[0]
-                train_pbar.set_postfix(loss=f"{loss.item():.4f}", lr=f"{current_lr:.2e}")
+                train_pbar.set_postfix(loss=f"{loss_val:.4f}", lr=f"{current_lr:.2e}")
                 accelerator.log({
-                    "train/loss": loss.item(),
+                    "train/loss": loss_val,
                     "train/lr": current_lr,
                     "train/epoch": epoch,
                     "train/step": global_step,
                 })
 
-        # Validation 
-        s2st_model.eval()
-        val_losses = []
-        val_pbar = tqdm(
-            valid_dataloader,
-            desc=f"Epoch {epoch}/{epochs} [Valid]",
-            disable=not accelerator.is_local_main_process,
-        )
-
-        with torch.no_grad():
-            for batch in val_pbar:
-                text_prediction, audio_prediction, audio_labels = s2st_model(
-                    T_encode=batch['text_encode'],
-                    T_decode=batch['text_decode'],
-                    A_encode=batch['audio_encode'],
-                    A_decode=batch['audio_decode'],
-                    phase=1,
-                    sub_tasks=batch['sub_tasks'],
-                )
-                global_token = unwrapped_model.get_global_token_task_3()
-
-                val_loss = compute_loss(
-                    loss_fn, text_prediction, audio_prediction,
-                    batch['labels'], audio_labels, batch['sub_tasks'],
-                )
-                val_losses.append(val_loss.item())
-                val_pbar.set_postfix(val_loss=f"{val_loss.item():.4f}")
-
-                # Build safe fallback tensors on the correct device
-                model_device = unwrapped_model.device
-                safe_audio_labels = audio_labels if audio_labels is not None else torch.empty(0, dtype=torch.long, device=model_device)
-                safe_audio_pred = audio_prediction if audio_prediction is not None else torch.empty(0, device=model_device)
-
-                metric.add_batch(
-                    text_prediction=text_prediction,
-                    text_target=batch['labels'],
-                    text_input=batch['text_encode'],
-                    global_tokens=global_token,
-                    audio_prediction=safe_audio_pred,
-                    audio_target=safe_audio_labels,
-                    sub_tasks=batch['sub_tasks'],
-                    task_names=batch['task_names'],
-                )
-
-        result = metric.compute()
-        avg_val_loss = sum(val_losses) / len(val_losses) if val_losses else 0.0
-
-        # Log validation metrics to WandB
-        accelerator.log({
-            "val/loss": avg_val_loss,
-            "val/asr_wer": result["asr_wer"],
-            "val/mt_bleu": result["mt_bleu"],
-            "val/utmos": result["utmos"],
-            "val/spk_similarity": result["spk_similarity"],
-            "val/tts_wer": result["tts_wer"],
-            "val/epoch": epoch,
-        })
-
-        accelerator.print(
-            f"[Epoch {epoch}/{epochs}] "
-            f"val_loss={avg_val_loss:.4f} | "
-            f"WER={result['asr_wer']:.4f} | "
-            f"BLEU={result['mt_bleu']:.2f} | "
-            f"UTMOS={result['utmos']:.3f} | "
-            f"SPK={result['spk_similarity']:.3f} | "
-            f"TTS_WER={result['tts_wer']:.4f}"
-        )
-
-        # Save latest_checkpoint 
+        # Save latest_checkpoint
         accelerator.save_state(latest_ckpt_path)
 
-        # Save best_checkpoint 
-        current_tts_wer = result["tts_wer"]
-        if current_tts_wer < tracker.best_tts_wer:
-            tracker.best_tts_wer = current_tts_wer
-            best_ckpt_path = os.path.join(ckpt_dir, "best_checkpoint")
-            accelerator.save_state(best_ckpt_path)
-            accelerator.print(f"New best TTS_WER={tracker.best_tts_wer:.4f} — saved best_checkpoint")
+        # Save separate checkpoint 
+        epoch_ckpt_path = os.path.join(ckpt_dir, f"epoch_{epoch}")
+        accelerator.save_state(epoch_ckpt_path)
+        accelerator.print(f"Saved separate checkpoint for Epoch {epoch} at '{epoch_ckpt_path}'")
+
+        # Clear GPU VRAM after epoch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     accelerator.end_training()
+    accelerator.print("\nAll Training Epochs Completed Successfully!")
+
 
 if __name__ == "__main__":
     main()

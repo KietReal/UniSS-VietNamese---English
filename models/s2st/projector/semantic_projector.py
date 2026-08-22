@@ -8,11 +8,13 @@ class SemanticProjector(nn.Module):
     def __init__(self):
         super().__init__()
         current_dir = os.path.dirname(os.path.abspath(__file__))
-        config_path = os.path.abspath(os.path.join(current_dir, '../../..', 'config.yaml'))
+        config_path = os.path.abspath(os.path.join(current_dir, '..', 'config.yaml'))
+        if not os.path.exists(config_path):
+            config_path = os.path.abspath(os.path.join(current_dir, '../../..', 'config.yaml'))
         if not os.path.exists(config_path):
             if os.path.exists('config.yaml'):
                 config_path = 'config.yaml'
-            elif os.path.exists('S2ST/config.yaml'):
+            elif os.path.exists('S2ST/models/s2st/config.yaml'):
                 config_path = 'S2ST/models/s2st/config.yaml'
 
         with open(config_path, 'r') as f:

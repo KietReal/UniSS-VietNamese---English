@@ -27,12 +27,16 @@ class Phase1Metrics:
             jiwer.RemoveMultipleSpaces(),
             jiwer.Strip(),
             jiwer.RemovePunctuation(),
+            jiwer.ReduceToListOfListOfWords(),
         ])
 
-        # TTS quality: UTMOS 
+        dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+        self.eval_dtype = dtype
+
+        # TTS quality: UTMOS
         self.utmos_model = torch.hub.load(
             "tarepan/SpeechMOS:v1.2.0", "utmos22_strong", trust_repo=True
-        ).to(device)
+        ).to(device=device, dtype=dtype)
         self.utmos_model.eval()
 
         # TTS speaker similarity: ECAPA-TDNN
@@ -41,21 +45,22 @@ class Phase1Metrics:
             run_opts={"device": device},
         )
 
-        # TTS (English): Whisper ASR
+        # TTS (English): Whisper ASR 
         self.whisper_processor = WhisperProcessor.from_pretrained("openai/whisper-base")
         self.whisper_model = WhisperForConditionalGeneration.from_pretrained(
-            "openai/whisper-base"
+            "openai/whisper-base",
+            torch_dtype=dtype,
         ).to(device)
         self.whisper_model.config.forced_decoder_ids = None
         self.whisper_model.eval()
 
-        # TTS (Vietnamese): PhoWhisper ASR
+        # TTS (Vietnamese): PhoWhisper ASR 
         self.pho_whisper = pipeline(
             "automatic-speech-recognition",
             model="vinai/PhoWhisper-base",
+            torch_dtype=dtype,
             device=device,
         )
-
 
         # Accumulator lists
         self._asr_wer_scores = []
@@ -68,7 +73,8 @@ class Phase1Metrics:
         """Decode a batch of token ID tensors to a list of strings."""
         sentences = []
         for row in token_ids:
-            text = self.text_tokenizer.decode(row, skip_special_tokens=True)
+            valid_ids = row[row >= 0]
+            text = self.text_tokenizer.decode(valid_ids, skip_special_tokens=True)
             sentences.append(text)
         return sentences
 
@@ -96,16 +102,21 @@ class Phase1Metrics:
     def _whisper_transcribe(self, waveforms: list[torch.Tensor]) -> list[str]:
         """Transcribe English waveforms via Whisper."""
         wav_list = [w.cpu().numpy() for w in waveforms]
+        dtype = torch.float16 if torch.cuda.is_available() else torch.float32
         inputs = self.whisper_processor(
             wav_list, sampling_rate=16000, return_tensors="pt"
-        ).input_features.to(self.device)
-        predicted_ids = self.whisper_model.generate(inputs)
+        ).input_features.to(device=self.device, dtype=dtype)
+        predicted_ids = self.whisper_model.generate(inputs, return_timestamps=True)
         return self.whisper_processor.batch_decode(predicted_ids, skip_special_tokens=True)
 
     def _phowhisper_transcribe(self, waveforms: list[torch.Tensor]) -> list[str]:
         """Transcribe Vietnamese waveforms via PhoWhisper."""
         wav_list = [w.cpu().numpy() for w in waveforms]
-        results = self.pho_whisper(wav_list)
+        results = self.pho_whisper(
+            wav_list,
+            batch_size=len(wav_list),
+            return_timestamps=True,
+        )
         return [r["text"] for r in results]
 
     @torch.no_grad()
@@ -179,10 +190,14 @@ class Phase1Metrics:
             # Skip BOS at position 0
             pred_toks = audio_prediction[i].argmax(dim=-1)
             pred_toks = pred_toks[1 : valid_len + 1]
+            
+            # Filter out any accidentally predicted EOS tokens (8192) to prevent CUDA device-side assert
+            pred_toks = pred_toks[(pred_toks >= 0) & (pred_toks < 8192)]
 
-            # Decode source text for WER reference
+            # Decode source text for WER reference (filtering negative tokens)
+            valid_input = text_input[i][text_input[i] >= 0]
             ref_text = self.text_tokenizer.decode(
-                text_input[i], skip_special_tokens=True
+                valid_input, skip_special_tokens=True
             )
 
             if task_names[i] == "tts_en":
@@ -205,12 +220,12 @@ class Phase1Metrics:
             en_pred_tensor = pad_sequence(en_pred_wavs, batch_first=True, padding_value=0.0)
             en_tgt_tensor = pad_sequence(en_tgt_wavs, batch_first=True, padding_value=0.0)
 
-            sim_scores, _ = self.spk_verifier.verify_batch(en_pred_tensor, en_tgt_tensor)
-            utmos_scores = self.utmos_model(en_pred_tensor, 16000)
+            sim_scores, _ = self.spk_verifier.verify_batch(en_pred_tensor.float(), en_tgt_tensor.float())
+            utmos_scores = self.utmos_model(en_pred_tensor.to(self.eval_dtype), 16000)
             transcriptions = self._whisper_transcribe(en_pred_wavs)
 
-            self._spk_sim_scores.extend(sim_scores.tolist())
-            self._utmos_scores.extend(utmos_scores.tolist())
+            self._spk_sim_scores.extend(sim_scores.view(-1).tolist())
+            self._utmos_scores.extend(utmos_scores.view(-1).tolist())
             self._tts_wer_scores.append(
                 wer(
                     reference=en_ref_texts,
@@ -229,12 +244,12 @@ class Phase1Metrics:
             vi_pred_tensor = pad_sequence(vi_pred_wavs, batch_first=True, padding_value=0.0)
             vi_tgt_tensor = pad_sequence(vi_tgt_wavs, batch_first=True, padding_value=0.0)
 
-            sim_scores, _ = self.spk_verifier.verify_batch(vi_pred_tensor, vi_tgt_tensor)
-            utmos_scores = self.utmos_model(vi_pred_tensor, 16000)
+            sim_scores, _ = self.spk_verifier.verify_batch(vi_pred_tensor.float(), vi_tgt_tensor.float())
+            utmos_scores = self.utmos_model(vi_pred_tensor.to(self.eval_dtype), 16000)
             transcriptions = self._phowhisper_transcribe(vi_pred_wavs)
 
-            self._spk_sim_scores.extend(sim_scores.tolist())
-            self._utmos_scores.extend(utmos_scores.tolist())
+            self._spk_sim_scores.extend(sim_scores.view(-1).tolist())
+            self._utmos_scores.extend(utmos_scores.view(-1).tolist())
             self._tts_wer_scores.append(
                 wer(
                     reference=vi_ref_texts,
@@ -243,7 +258,6 @@ class Phase1Metrics:
                     hypothesis_transform=self.wer_transform,
                 )
             )
-
 
     def compute(self) -> dict[str, float]:
         """Compute epoch-level metrics and reset accumulators."""

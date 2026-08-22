@@ -320,6 +320,16 @@ Each checkpoint (saved via Accelerate) includes:
 
 ---
 
+## Evaluation & Results
+
+### Phase 1 Multi-Task Evaluation
+
+![Phase 1 Evaluation Results](models/s2st/Evaluation/final_results_phase1.png)
+
+Based on the multi-task evaluation metrics across all 10 epochs, we choose the **Epoch 8** checkpoint to continually train in Phase 2, as it achieves the best balance across tasks (highest MT BLEU score and lowest TTS WER).
+
+---
+
 ## Inference
 
 > **Note**: Inference pipeline is planned for Phase 2/3. The current Phase 1 implementation focuses on multi-task pre-training.

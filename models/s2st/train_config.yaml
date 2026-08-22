@@ -1,24 +1,25 @@
 # Training 
 training:
   epochs: 10
-  batch_size: 4
-  gradient_accumulation_steps: 16     
+  batch_size: 8
+  gradient_accumulation_steps: 8  
   max_grad_norm: 1.0
+  mixed_precision: "fp16"  
   num_workers: 8
   seed: 75
 
 # Optimizer 
 optimizer:
-  type: AdamW
-  lr: 3e-4
+  type: AdamW8bit 
+  lr: 0.0003
   weight_decay: 0.01
   betas: [0.9, 0.999]
-  eps: 1.0e-8
+  eps: 0.00000001
 
 # Scheduler 
 scheduler:
   warmup_ratio: 0.1
-  min_lr: 1e-6
+  min_lr: 0.000001
 
 # Loss 
 loss:
@@ -28,6 +29,7 @@ loss:
 wandb:
   project: "S2ST-Phase1"
   run_name: "phase1-multitask-v1"
+  mode: "online"  
 
 # Data 
 data:
