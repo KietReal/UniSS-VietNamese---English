@@ -100,9 +100,13 @@ def AugmentedAudio(
     augmented_cut = augmented_cuts[0]
     augmented_audio = augmented_cut.load_audio() # NumPy array [Channels, Samples]
     
+    ori_audio = cuts[0].load_audio()
+
     # Squeeze to ensure it's a 1D tensor (Samples,) for sequence padding
     audio_tensor = torch.from_numpy(augmented_audio).float().squeeze() 
-    return audio_tensor
+    ori_tensor   = torch.from_numpy(ori_audio).float().squeeze()
+
+    return audio_tensor, ori_tensor
 
 def get_ref_clip(
     wav: torch.Tensor, 

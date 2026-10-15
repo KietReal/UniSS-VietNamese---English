@@ -11,7 +11,7 @@ AUDIO_EOS_ID = 8192
 
 
 class Phase1Metrics:
-    """Evaluation metrics for Phase 1 multi-task S2ST training."""
+    """Evaluation metrics for Phase 1."""
 
     def __init__(self, device: str, text_tokenizer, audio_tokenizer):
         self.device = device
@@ -100,11 +100,15 @@ class Phase1Metrics:
         return clean_waveforms
 
     def _whisper_transcribe(self, waveforms: list[torch.Tensor]) -> list[str]:
-        """Transcribe English waveforms via Whisper."""
+        """Transcribe English waveforms via Whisper"""
         wav_list = [w.cpu().numpy() for w in waveforms]
         dtype = torch.float16 if torch.cuda.is_available() else torch.float32
         inputs = self.whisper_processor(
-            wav_list, sampling_rate=16000, return_tensors="pt"
+            wav_list,
+            sampling_rate=16000,
+            return_tensors="pt",
+            truncation=True,
+            padding="max_length",
         ).input_features.to(device=self.device, dtype=dtype)
         predicted_ids = self.whisper_model.generate(inputs, return_timestamps=True)
         return self.whisper_processor.batch_decode(predicted_ids, skip_special_tokens=True)
@@ -115,6 +119,7 @@ class Phase1Metrics:
         results = self.pho_whisper(
             wav_list,
             batch_size=len(wav_list),
+            chunk_length_s=30,
             return_timestamps=True,
         )
         return [r["text"] for r in results]
@@ -180,21 +185,15 @@ class Phase1Metrics:
         for local_idx, batch_idx in enumerate(tts_indices):
             i = batch_idx.item()
 
-            # Extract valid target tokens (exclude padding=-100 and EOS=8192)
-            # audio_target is indexed by local_idx (TTS-only tensor)
             valid_mask = (audio_target[local_idx] != -100) & (audio_target[local_idx] != AUDIO_EOS_ID)
             valid_len = valid_mask.sum().item()
             tgt_toks = audio_target[local_idx, :valid_len]
 
-            # Extract predicted tokens from full-batch audio_prediction using batch index
-            # Skip BOS at position 0
             pred_toks = audio_prediction[i].argmax(dim=-1)
-            pred_toks = pred_toks[1 : valid_len + 1]
+            pred_toks = pred_toks[ : valid_len + 1]
             
-            # Filter out any accidentally predicted EOS tokens (8192) to prevent CUDA device-side assert
             pred_toks = pred_toks[(pred_toks >= 0) & (pred_toks < 8192)]
 
-            # Decode source text for WER reference (filtering negative tokens)
             valid_input = text_input[i][text_input[i] >= 0]
             ref_text = self.text_tokenizer.decode(
                 valid_input, skip_special_tokens=True

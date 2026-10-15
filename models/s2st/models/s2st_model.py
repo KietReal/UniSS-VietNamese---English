@@ -23,12 +23,12 @@ from utils.audio_utils import get_ref_clip, audio2token
 class S2STModel(nn.Module):
     def __init__(self, envit5_path=None, sparkTTS_path=None):
         super().__init__()
-        
+
         current_dir = os.path.dirname(os.path.abspath(__file__))
         config_path = os.path.abspath(os.path.join(current_dir, '../config.yaml'))
         if not os.path.exists(config_path):
             config_path = os.path.abspath(os.path.join(current_dir, '../../config.yaml'))
-            
+
         with open(config_path, 'r') as f:
             self.config = yaml.safe_load(f)
 
@@ -36,13 +36,13 @@ class S2STModel(nn.Module):
         self.semantic_projector = SemanticProjector()
         self.speaker_projector = SpeakerProjector()
         self.audio_header = AudioHeader()
-        
+
         ### 2. Initalize LLM
         if envit5_path is None:
             envit5_path = os.path.abspath(os.path.join(current_dir, '../checkpoints/envit5-translation'))
         if sparkTTS_path is None:
             sparkTTS_path = os.path.abspath(os.path.join(current_dir, '../checkpoints/Spark-TTS-0.5B'))
-        
+
         try:
             self.envit5 = AutoModelForSeq2SeqLM.from_pretrained(
                 envit5_path,
@@ -53,8 +53,12 @@ class S2STModel(nn.Module):
         self.envit5_tokenizer = AutoTokenizer.from_pretrained(envit5_path)
 
         # Add special tokens to tokenizer and resize LLM embedding table
-        special_tokens = ['<S2TT>', '<MT>', '<TTS>', '<ASR>', '<ENG>', '<VIE>', '<BOS>']
-        num_added = self.envit5_tokenizer.add_special_tokens({'additional_special_tokens': special_tokens})
+        special_tokens = ['<S2TT>', '<MT>', '<TTS>', '<ASR>', '<ENG>', '<VIE>', '<BOS>', '<S2ST>']
+        speed_tokens   = ['<0.5>', '<0.6>', '<0.7>', '<0.8>', '<0.9>', '<1.0>', '<1.1>', '<1.2>', '<1.3>',
+                          '<1.4>', '<1.5>', '<1.6>', '<1.7>', '<1.8>', '<1.9>', '<2.0>']
+        all_special = special_tokens + speed_tokens
+
+        num_added = self.envit5_tokenizer.add_special_tokens({'additional_special_tokens': all_special})
         if num_added > 0:
             self.envit5.resize_token_embeddings(len(self.envit5_tokenizer))
 
@@ -81,7 +85,7 @@ class S2STModel(nn.Module):
         self.sparkTTS = BiCodecTokenizer(model_dir=sparkTTS_path, device=torch.device("cpu"))
         self.semantic_quantizer = self.sparkTTS.model.quantizer
         self.speaker_encoder = self.sparkTTS.model.speaker_encoder
-        
+
         # Freeze SparkTTS nn.Module components
         self.sparkTTS.model.eval()
         for param in self.sparkTTS.model.parameters():
@@ -105,7 +109,7 @@ class S2STModel(nn.Module):
 
     def _move_sparkTTS_to_device(self):
         """Move non-nn.Module SparkTTS components to the correct device.
-        
+
         BiCodecTokenizer is not an nn.Module, so Accelerate won't move it automatically.
         This must be called after accelerator.prepare() or manual .to(device).
         """
@@ -118,9 +122,9 @@ class S2STModel(nn.Module):
         self.semantic_quantizer = self.sparkTTS.model.quantizer
         self.speaker_encoder = self.sparkTTS.model.speaker_encoder
 
-    def llm_forward(self, inputs_encoder: torch.Tensor, inputs_decoder: torch.Tensor, 
+    def llm_forward(self, inputs_encoder: torch.Tensor, inputs_decoder: torch.Tensor,
         att_mask: torch.Tensor, decoder_att_mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        
+
         encoder_outputs = self.envit5.encoder(
             inputs_embeds=inputs_encoder,
             attention_mask=att_mask,
@@ -129,50 +133,52 @@ class S2STModel(nn.Module):
 
         decoder_outputs = self.envit5.decoder(
             inputs_embeds=inputs_decoder,
-            attention_mask=decoder_att_mask,          
+            attention_mask=decoder_att_mask,
             encoder_hidden_states=encoder_outputs.last_hidden_state,
-            encoder_attention_mask=att_mask, 
+            encoder_attention_mask=att_mask,
             return_dict=True,
         )
         pre = decoder_outputs.last_hidden_state
-        
+
         text_prediction = self.envit5.lm_head(pre)
         audio_prediction = self.audio_header(pre)
 
         return text_prediction, audio_prediction
 
-    def get_audio_tokens(self, audio: torch.Tensor, tts_mask: torch.Tensor):
-        audio = audio[tts_mask]
+    def get_audio_tokens(self, audio: torch.Tensor, tts_mask: torch.Tensor|None):
+        if tts_mask is not None:
+            audio = audio[tts_mask]
+
         ref_audio = get_ref_clip(wav=audio)
         global_tokens, semantic_tokens = audio2token(
             tokenizer=self.sparkTTS, wavs_2d=audio, ref_wavs_2d=ref_audio
         )
-        return global_tokens, semantic_tokens         
+        return global_tokens, semantic_tokens
 
     def get_global_token_task_3(self):
         return self.global_token_task_3
 
-    def phase_1_forward(self, T_encode: torch.Tensor, T_decode: torch.Tensor, 
+    def phase_1_forward(self, T_encode: torch.Tensor, T_decode: torch.Tensor,
                         A_encode: torch.Tensor, A_decode: torch.Tensor, sub_tasks: torch.Tensor):
-        
+
         batch_size = sub_tasks.size(0)
         device = self.device
-        pad_id = 0 
+        pad_id = 0
         self.global_token_task_3 = None
 
         # 1. Look up Text Embeddings for the whole batch
-        embed_T_encode = self.embedding(T_encode) 
-        embed_T_decode = self.embedding(T_decode) 
+        embed_T_encode = self.embedding(T_encode)
+        embed_T_decode = self.embedding(T_decode)
 
-        # 2. Extract Audio Features on GPU 
+        # 2. Extract Audio Features on GPU
         enc_mask = (sub_tasks == 1) | (sub_tasks == 2)
         if enc_mask.any():
             with torch.no_grad():
                 enc_global_toks, enc_sem_toks = self.get_audio_tokens(audio=A_encode, tts_mask=enc_mask)
                 S_speaker_raw = self.speaker_encoder.detokenize(enc_global_toks).unsqueeze(1)
                 S_Ling_raw = self.semantic_quantizer.detokenize(enc_sem_toks).transpose(1, 2)
-            
-            S_speaker_enc = self.speaker_projector(S_speaker_raw) 
+
+            S_speaker_enc = self.speaker_projector(S_speaker_raw)
             S_Ling_enc = self.semantic_projector(S_Ling_raw)
 
         dec_mask = (sub_tasks == 3)
@@ -183,7 +189,7 @@ class S2STModel(nn.Module):
                 S_Sem_dec_raw = self.semantic_quantizer.detokenize(dec_sem_toks).transpose(1, 2)
 
                 self.global_token_task_3 = dec_global_toks
-                
+
             S_speaker_dec = self.speaker_projector(S_speaker_dec_raw)
             S_Sem_dec = self.semantic_projector(S_Sem_dec_raw)
 
@@ -199,39 +205,39 @@ class S2STModel(nn.Module):
             valid_len_enc = (T_encode[i] != pad_id).sum().item()
             valid_len_dec = (T_decode[i] != pad_id).sum().item()
 
-            # BUILD ENCODER SEQUENCE 
+            # ENCODER
             if task in [1, 2]: # ASR (1), S2TT (2)
-                prompt_embeds = embed_T_encode[i, :2] 
+                prompt_embeds = embed_T_encode[i, :2]
                 spk_embeds = S_speaker_enc[enc_audio_idx]
                 ling_embeds = S_Ling_enc[enc_audio_idx]
                 enc_seq = torch.cat([prompt_embeds, spk_embeds, ling_embeds], dim=0)
                 enc_audio_idx += 1
-                
+
             elif task == 3: # TTS (3)
                 prompt_embeds = embed_T_encode[i, :2]
-                spk_embeds = S_speaker_dec[dec_audio_idx] 
+                spk_embeds = S_speaker_dec[dec_audio_idx]
                 text_embeds = embed_T_encode[i, 2:valid_len_enc]
                 enc_seq = torch.cat([prompt_embeds, spk_embeds, text_embeds], dim=0)
-                
+
             else: # MT (4)
                 enc_seq = embed_T_encode[i, :valid_len_enc]
-                
+
             inputs_encode_list.append(enc_seq)
             att_mask_list.append(torch.ones(enc_seq.size(0), dtype=torch.bool, device=device))
 
-            # BUILD DECODER SEQUENCE 
+            # DECODER
             if task in [1, 2, 4]: # ASR, S2TT, MT
                 dec_seq = embed_T_decode[i, :valid_len_dec]
                 inputs_decode_list.append(dec_seq)
                 dec_att_mask_list.append(torch.ones(dec_seq.size(0), dtype=torch.bool, device=device))
-                
+
             elif task == 3: # TTS
                 sem_embeds = S_Sem_dec[dec_audio_idx]
                 # audio_bos_embed is (1, 768), sem_embeds is (seq, 768) — both 2D, concat on dim=0
                 dec_seq = torch.cat([self.audio_bos_embed, sem_embeds], dim=0)
                 inputs_decode_list.append(dec_seq)
                 dec_att_mask_list.append(torch.ones(dec_seq.size(0), dtype=torch.bool, device=device))
-                
+
                 # Build audio label: semantic tokens for this item + EOS token
                 eos_token = torch.tensor([self.AUDIO_EOS_ID], dtype=dec_sem_toks.dtype, device=device)
                 item_audio_labels = torch.cat([dec_sem_toks[dec_audio_idx], eos_token], dim=0)
@@ -241,7 +247,7 @@ class S2STModel(nn.Module):
         # 4. Pad the sequences to form batch tensors
         inputs_encoder = pad_sequence(inputs_encode_list, batch_first=True, padding_value=0.0)
         inputs_decoder = pad_sequence(inputs_decode_list, batch_first=True, padding_value=0.0)
-        
+
         att_mask = pad_sequence(att_mask_list, batch_first=True, padding_value=False)
         decoder_att_mask = pad_sequence(dec_att_mask_list, batch_first=True, padding_value=False)
 
@@ -255,14 +261,61 @@ class S2STModel(nn.Module):
 
         return text_prediction, audio_prediction, audio_labels
 
-    def phase_2_forward(self):
-        pass
+    def phase_2_forward(self, special_tokens: torch.Tensor, A_encode: torch.Tensor, A_decode: torch.Tensor):
+        """
+            Args:
+
+            special_tokens: (batch, 3) int64 — [task_token, lang_token, speed_token]
+            A_encode: audio encode. shape: (batch, wav_len) float32
+            A_decode: audio decode. shape: (batch, wav_len) float32
+
+        """
+        device = self.device
+        B = A_encode.size(0)
+
+        # Embed special tokens: (B, 3) -> (B, 3, 768)
+        embed_special = self.embedding(special_tokens)
+
+        with torch.no_grad():
+            global_encode_tokens, semantic_encode_tokens = self.get_audio_tokens(audio=A_encode, tts_mask=None)
+            global_decode_tokens, semantic_decode_tokens = self.get_audio_tokens(audio=A_decode, tts_mask=None)
+
+            S_speaker_raw = self.speaker_encoder.detokenize(global_encode_tokens).unsqueeze(1)    # (B, 1, 1024)
+            S_Ling_raw    = self.semantic_quantizer.detokenize(semantic_encode_tokens).transpose(1, 2)  # (B, seq_enc, 1024)
+
+            S_sem_raw     = self.semantic_quantizer.detokenize(semantic_decode_tokens).transpose(1, 2)  # (B, seq_dec, 1024)
+
+        S_speaker = self.speaker_projector(S_speaker_raw)   # (B, 1, 768)
+        S_Ling    = self.semantic_projector(S_Ling_raw)      # (B, seq_enc, 768)
+
+        S_sem     = self.semantic_projector(S_sem_raw)       # (B, seq_dec, 768)
+
+        # Encoder: [special_tokens, speaker_embed, linguistic_embed]  
+        inputs_encoder = torch.cat([embed_special, S_speaker, S_Ling], dim=1)  # (B, 3+1+seq_enc, 768)
+
+        # Decoder: [audio_bos, semantic_decode_embed]
+        bos_embed = self.audio_bos_embed.unsqueeze(0).expand(B, -1, -1)     # (B, 1, 768)
+        inputs_decoder = torch.cat([bos_embed, S_sem], dim=1)               # (B, 1+seq_dec, 768)
+
+        # Labels: semantic_decode_token_ids + AUDIO_EOS_ID
+        eos_ids = torch.full((B, 1), self.AUDIO_EOS_ID, dtype=semantic_decode_tokens.dtype, device=device)
+        labels = torch.cat([semantic_decode_tokens, eos_ids], dim=1)           # (B, seq_dec+1)
+
+        # Attention masks: (B, L)
+        att_mask = torch.ones(B, inputs_encoder.size(1), dtype=torch.bool, device=device)
+        decoder_att_mask = torch.ones(B, inputs_decoder.size(1), dtype=torch.bool, device=device)
+
+        _, audio_prediction = self.llm_forward(inputs_encoder, inputs_decoder, att_mask, decoder_att_mask)
+
+        return audio_prediction, labels, global_encode_tokens
 
     def phase_3_forward(self):
         pass
 
-    def forward(self, T_encode: torch.Tensor, T_decode: torch.Tensor, 
-                A_encode: torch.Tensor, A_decode: torch.Tensor, phase: int, sub_tasks: torch.Tensor):
+    def forward(self, T_encode: torch.Tensor|None = None, T_decode: torch.Tensor|None = None,
+                A_encode: torch.Tensor|None = None, A_decode: torch.Tensor|None = None,
+                phase: int|None = None, sub_tasks: torch.Tensor|None = None,
+                special_tokens: torch.Tensor|None = None):
         """
             Args:
 
@@ -274,7 +327,8 @@ class S2STModel(nn.Module):
             A_decode: audio decode. shape: (batch, wav_len)
 
             phase: int (1-2-3)
-            sub_task: only for phas 1, 3.
+            sub_task: only for phase 1, 3.
+            special_tokens: (batch, 3) int64 — only for phase 2. [task, lang, speed]
 
         """
 
@@ -284,6 +338,9 @@ class S2STModel(nn.Module):
             )
             return text_prediction, audio_prediction, audio_labels
         elif phase == 2:
-            pass
+            audio_prediction, audio_labels, global_tokens = self.phase_2_forward(
+                special_tokens, A_encode, A_decode
+            )
+            return audio_prediction, audio_labels, global_tokens
         elif phase == 3:
             pass
